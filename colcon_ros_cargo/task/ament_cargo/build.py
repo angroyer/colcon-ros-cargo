@@ -124,20 +124,20 @@ class AmentCargoBuildTask(CargoBuildTask):
         :param package_paths: A mapping of package names to paths
         :param config_path: Optional path for .cargo/config.toml
         """
-        args = self.context.args
         src_dir = Path(self.context.pkg.path)
         if config_path:
             config_dir = config_path.resolve() / '.cargo'
         else:
             config_dir = Path.cwd() / '.cargo'
-            # The current package directory might be a link to another directory.
-            # However, cargo only looks for configurations in the package directory
+            # The package path might be a link to another directory.
+            # Cargo only looks for configuration in the package directory
             # and in all its parent directories.
             # Hence, if the package directory is link, ./cargo/config.toml
             # should be installed above the directory pointed to
             # in order cargo to necessarily hit it.
             if src_dir.absolute() != src_dir.resolve():
-                logger.warn('The package source path may be under a symbolic link. '
+                logger.warn(
+                    'The package source path may be under a symbolic link. '
                     'Use --config-path option to store .cargo/config.toml '
                     'in a way it will be hit by cargo')
         config_dir.mkdir(exist_ok=True)
@@ -152,18 +152,21 @@ class AmentCargoBuildTask(CargoBuildTask):
                 if cargo_config_toml_out.exists():
                     try:
                         existing = toml.load(str(cargo_config_toml_out))
-                        for name, info in existing.get('patch', {}).get(
-                                'crates-io', {}).items():
-                            merged.setdefault(name, info['path'])
-                    except Exception:
+                    except (OSError, toml.TomlDecodeError):
                         pass
+                    else:
+                        patches = existing.get('patch', {}).get(
+                            'crates-io', {})
+                        if isinstance(patches, dict):
+                            for name, info in patches.items():
+                                if isinstance(info, dict) and 'path' in info:
+                                    merged.setdefault(name, info['path'])
 
-                # Ensure every referenced path has a parseable manifest.
-                for pkg, path in merged.items():
-                    _stub_missing_cargo_toml(pkg, path)
-
-                patches = {pkg: {'path': str(path)}
-                           for pkg, path in merged.items()}
+                patches = {
+                    pkg: {'path': str(_resolve_cargo_package_path(
+                        pkg, path, config_dir / 'stubs'))}
+                    for pkg, path in merged.items()
+                }
                 content = {'patch': {'crates-io': patches}}
 
                 # Atomic write via temp-file + rename.
@@ -173,66 +176,103 @@ class AmentCargoBuildTask(CargoBuildTask):
                     with os.fdopen(fd, 'w') as f:
                         toml.dump(content, f)
                     os.replace(tmp, str(cargo_config_toml_out))
-                except BaseException:
+                finally:
                     try:
                         os.unlink(tmp)
                     except OSError:
                         pass
-                    raise
             finally:
                 fcntl.flock(lock_file, fcntl.LOCK_UN)
 
 
-def _stub_missing_cargo_toml(pkg, path, _visited=None):
-    """Create a stub Cargo package at path if Cargo.toml does not exist.
-
-    Cargo validates every [patch.crates-io] entry, including transitive
-    path dependencies.  When a patched path does not yet contain a valid
-    Cargo manifest (e.g. the package has not been installed yet), builds
-    of unrelated packages fail.  This function creates a minimal stub so
-    that cargo can parse the manifest graph.
-
-    Only creates files when Cargo.toml is truly absent, to avoid racing
-    with cargo-ament-build's remove_dir_all during a parallel install.
-    """
+def _resolve_cargo_package_path(pkg, path, stubs_dir, _visited=None):
+    """Return a valid package path, using a stable stub when necessary."""
     if _visited is None:
         _visited = set()
     try:
-        real = str(Path(path).resolve())
+        pkg_dir = Path(path).resolve()
     except OSError:
-        return
-    if real in _visited:
-        return
-    _visited.add(real)
+        return _create_cargo_stub(pkg, stubs_dir)
+    if pkg_dir in _visited:
+        return pkg_dir
+    _visited.add(pkg_dir)
 
     try:
-        pkg_dir = Path(path)
         manifest = pkg_dir / 'Cargo.toml'
-        if not manifest.exists():
-            pkg_dir.mkdir(parents=True, exist_ok=True)
-            manifest.write_text(
-                '[package]\nname = "{}"\nversion = "0.0.0"\n'
-                'edition = "2021"\n\n[lib]\npath = "src/lib.rs"\n'
-                .format(pkg)
-            )
-            src_dir = pkg_dir / 'src'
-            src_dir.mkdir(parents=True, exist_ok=True)
-            (src_dir / 'lib.rs').write_text('')
+        cargo_toml = toml.load(str(manifest))
+        package = cargo_toml.get('package', {})
+        if not isinstance(package, dict) or package.get('name') != pkg:
+            return _use_cargo_stub(pkg, path, stubs_dir)
+        if _is_generated_cargo_stub(pkg_dir, cargo_toml):
+            stable_stub = (Path(stubs_dir) / pkg).resolve()
+            if pkg_dir == stable_stub:
+                return pkg_dir
+            return _use_cargo_stub(pkg, path, stubs_dir)
 
-        # Recursively stub transitive path dependencies.
-        try:
-            cargo_toml = toml.load(str(manifest))
-            for section in ('dependencies', 'dev-dependencies',
-                            'build-dependencies'):
-                for dep_name, spec in cargo_toml.get(section, {}).items():
-                    if isinstance(spec, dict) and 'path' in spec:
-                        dep_path = (pkg_dir / spec['path']).resolve()
-                        _stub_missing_cargo_toml(
-                            dep_name, str(dep_path), _visited)
-        except Exception:
-            pass
+        for section in ('dependencies', 'dev-dependencies',
+                        'build-dependencies'):
+            for dep_name, spec in cargo_toml.get(section, {}).items():
+                if isinstance(spec, dict) and 'path' in spec:
+                    dep_package = spec.get('package', dep_name)
+                    dep_path = pkg_dir / spec['path']
+                    if _resolve_cargo_package_path(
+                            dep_package, dep_path, stubs_dir,
+                            _visited) != dep_path.resolve():
+                        return _use_cargo_stub(pkg, path, stubs_dir)
+        return pkg_dir
+    except (AttributeError, OSError, TypeError, toml.TomlDecodeError,
+            RuntimeError):
+        return _use_cargo_stub(pkg, path, stubs_dir)
+
+
+def _is_generated_cargo_stub(pkg_dir, cargo_toml):
+    """Detect stable stubs and the legacy stubs written into install trees."""
+    package = cargo_toml.get('package', {})
+    metadata = package.get('metadata', {})
+    if isinstance(metadata, dict):
+        stub_metadata = metadata.get('colcon-ros-cargo', {})
+        if (isinstance(stub_metadata, dict)
+                and stub_metadata.get('stub') is True):
+            return True
+
+    lib = cargo_toml.get('lib', {})
+    if not isinstance(lib, dict):
+        return False
+    if package.get('version') != '0.0.0' or lib.get('path') != 'src/lib.rs':
+        return False
+    try:
+        return (pkg_dir / 'src' / 'lib.rs').stat().st_size == 0
     except OSError:
-        pass
+        return False
+
+
+def _use_cargo_stub(pkg, invalid_path, stubs_dir):
+    stub_path = _create_cargo_stub(pkg, stubs_dir)
+    logger.warning(
+        'Cargo package %s at %s is missing or incomplete; using stub at %s',
+        pkg, invalid_path, stub_path)
+    return stub_path
+
+
+def _create_cargo_stub(pkg, stubs_dir):
+    """Create a minimal package outside install prefixes for Cargo patches."""
+    pkg_dir = Path(stubs_dir) / pkg
+    pkg_dir.mkdir(parents=True, exist_ok=True)
+    manifest = pkg_dir / 'Cargo.toml'
+    if not manifest.exists():
+        src_dir = pkg_dir / 'src'
+        src_dir.mkdir(parents=True, exist_ok=True)
+        (src_dir / 'lib.rs').write_text('')
+        manifest.write_text(toml.dumps({
+            'package': {
+                'name': pkg,
+                'version': '0.0.0',
+                'edition': '2021',
+                'metadata': {'colcon-ros-cargo': {'stub': True}},
+            },
+            'lib': {'path': 'src/lib.rs'},
+        }))
+    return pkg_dir
 
 
 def write_cargo_config_toml(package_paths):

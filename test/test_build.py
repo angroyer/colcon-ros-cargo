@@ -14,9 +14,13 @@ from colcon_core.package_descriptor import PackageDescriptor
 from colcon_core.subprocess import new_event_loop
 from colcon_core.task import TaskContext
 from colcon_ros.package_identification.ros import RosPackageIdentification
-from colcon_ros_cargo.task.ament_cargo.build import AmentCargoBuildTask
+from colcon_ros_cargo.task.ament_cargo.build import (
+    _resolve_cargo_package_path,
+    AmentCargoBuildTask,
+)
 from colcon_ros_cargo.task.ament_cargo.test import AmentCargoTestTask
 import pytest
+import toml
 
 TEST_PACKAGE_NAME = 'rust-sample-package'
 
@@ -64,6 +68,7 @@ def test_build_and_test_package():
                                       clean_build=None,
                                       cargo_args=None,
                                       lookup_in_workspace=None,
+                                      config_path=None,
                                   ),
                                   dependencies={}
                                   )
@@ -122,3 +127,88 @@ def check_result_file(path):
     fmt_result = testsuite.find("testcase[@name='fmt']")
     assert fmt_result is not None
     assert fmt_result.find('failure') is None
+
+
+def test_incomplete_patch_package_uses_stable_stub(tmp_path):
+    installed_package = tmp_path / 'install' / 'share' / 'ros2_foo' / 'rust'
+    installed_package.mkdir(parents=True)
+    manifest = installed_package / 'Cargo.toml'
+    manifest.write_text('[package]\nname = "another_crate"\n')
+    original_manifest = manifest.read_text()
+
+    stub_path = _resolve_cargo_package_path(
+        'ros2_foo', installed_package, tmp_path / '.cargo' / 'stubs')
+
+    assert stub_path == tmp_path / '.cargo' / 'stubs' / 'ros2_foo'
+    assert 'name = "ros2_foo"' in (stub_path / 'Cargo.toml').read_text()
+    assert manifest.read_text() == original_manifest
+
+
+def test_valid_patch_package_keeps_installed_path(tmp_path):
+    installed_package = tmp_path / 'install' / 'share' / 'ros2_foo' / 'rust'
+    installed_package.mkdir(parents=True)
+    (installed_package / 'Cargo.toml').write_text(
+        '[package]\nname = "ros2_foo"\nversion = "1.0.0"\n')
+
+    resolved_path = _resolve_cargo_package_path(
+        'ros2_foo', installed_package, tmp_path / '.cargo' / 'stubs')
+
+    assert resolved_path == installed_package
+    assert not (tmp_path / '.cargo' / 'stubs').exists()
+
+
+def test_legacy_install_stub_uses_stable_stub(tmp_path):
+    installed_package = tmp_path / 'install' / 'share' / 'ros2_foo' / 'rust'
+    src_dir = installed_package / 'src'
+    src_dir.mkdir(parents=True)
+    manifest = installed_package / 'Cargo.toml'
+    manifest.write_text(
+        '[package]\nname = "ros2_foo"\nversion = "0.0.0"\n'
+        'edition = "2021"\n\n[lib]\npath = "src/lib.rs"\n')
+    (src_dir / 'lib.rs').write_text('')
+
+    stub_path = _resolve_cargo_package_path(
+        'ros2_foo', installed_package, tmp_path / '.cargo' / 'stubs')
+
+    assert stub_path == tmp_path / '.cargo' / 'stubs' / 'ros2_foo'
+    assert manifest.exists()
+    assert (installed_package / 'src' / 'lib.rs').read_text() == ''
+
+
+def test_stable_stub_remains_unchanged(tmp_path):
+    stable_stub = tmp_path / '.cargo' / 'stubs' / 'ros2_foo'
+    stable_stub.mkdir(parents=True)
+    (stable_stub / 'src').mkdir()
+    (stable_stub / 'src' / 'lib.rs').write_text('')
+    (stable_stub / 'Cargo.toml').write_text(
+        '[package]\nname = "ros2_foo"\nversion = "0.0.0"\n'
+        'edition = "2021"\n\n[lib]\npath = "src/lib.rs"\n\n'
+        '[package.metadata.colcon-ros-cargo]\nstub = true\n')
+
+    resolved_path = _resolve_cargo_package_path(
+        'ros2_foo', stable_stub, tmp_path / '.cargo' / 'stubs')
+
+    assert resolved_path == stable_stub
+
+
+def test_config_writer_patches_legacy_stub_to_stable_path(tmp_path):
+    installed_package = tmp_path / 'install' / 'share' / 'ros2_foo' / 'rust'
+    src_dir = installed_package / 'src'
+    src_dir.mkdir(parents=True)
+    (installed_package / 'Cargo.toml').write_text(
+        '[package]\nname = "ros2_foo"\nversion = "0.0.0"\n'
+        'edition = "2021"\n\n[lib]\npath = "src/lib.rs"\n')
+    (src_dir / 'lib.rs').write_text('')
+
+    context = TaskContext(
+        pkg=PackageDescriptor(test_project_path),
+        args=SimpleNamespace(),
+        dependencies={})
+    task = AmentCargoBuildTask()
+    task.set_context(context=context)
+    task.write_cargo_config_toml(
+        {'ros2_foo': str(installed_package)}, config_path=tmp_path)
+
+    config = toml.load(str(tmp_path / '.cargo' / 'config.toml'))
+    patched_path = config['patch']['crates-io']['ros2_foo']['path']
+    assert Path(patched_path) == tmp_path / '.cargo' / 'stubs' / 'ros2_foo'
